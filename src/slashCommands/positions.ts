@@ -1,8 +1,20 @@
-import { SlashCommandBuilder, EmbedBuilder, APIEmbedField } from "discord.js";
+import {
+  SlashCommandBuilder,
+  EmbedBuilder,
+  APIEmbedField,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
+} from "discord.js";
+import * as bs58 from "bs58";
 import { SlashCommand } from "../types";
 import { Supabase } from "../services/supabase";
-import { PositionItem, getUserPositions } from "../services/hxro";
-import { PublicKey } from "@solana/web3.js";
+import {
+  PositionItem,
+  getUserPositions,
+  settlePosition,
+} from "../services/hxro";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import { MarketStatusEnum, calculateOdd } from "@hxronetwork/parimutuelsdk";
 import { formatNumber } from "../utils/formatNumber";
 
@@ -84,6 +96,7 @@ const command: SlashCommand = {
         ];
       }
 
+      let buttons: ButtonBuilder[] = [];
       if (settledPositions.length > 0) {
         fields.push({
           name: "Settled",
@@ -100,6 +113,51 @@ const command: SlashCommand = {
               [] as APIEmbedField[]
             ),
         ];
+
+        // find payout
+        const payouts: { position: PositionItem; payout: number }[] = [];
+        settledPositions.forEach((pos) => {
+          let payout = -1;
+
+          const totalPool = pos.pool.short + pos.pool.long;
+          if (
+            pos.locked.price >= pos.settled.price &&
+            pos.position.short &&
+            pos.pool.short
+          ) {
+            payout = (pos.position.short / pos.pool.short) * totalPool;
+          }
+
+          if (
+            pos.locked.price < pos.settled.price &&
+            pos.position.long &&
+            pos.pool.long
+          ) {
+            payout = (pos.position.long / pos.pool.long) * totalPool;
+          }
+
+          if (payout > 0) {
+            payouts.push({
+              position: pos,
+              payout,
+            });
+          }
+        });
+
+        payouts.forEach((payout) => {
+          console.log("button id:", payout.position.key.parimutuelPubkey);
+          buttons.push(
+            new ButtonBuilder()
+              .setCustomId(payout.position.key.parimutuelPubkey)
+              .setLabel("Settle")
+              .setStyle(ButtonStyle.Success)
+          );
+        });
+      }
+
+      let row;
+      if (buttons.length > 0) {
+        row = new ActionRowBuilder().addComponents(...buttons);
       }
 
       const embed = new EmbedBuilder()
@@ -111,9 +169,39 @@ const command: SlashCommand = {
           iconURL: interaction.client.user?.avatarURL() || undefined,
         });
 
-      await interaction.editReply({
+      const response = await interaction.editReply({
         embeds: [embed],
+        // @ts-ignore
+        components: row ? [row] : [],
       });
+
+      if (buttons.length > 0) {
+        const confirmation = await response.awaitMessageComponent({
+          filter: (i) => i.user.id === interaction.user.id,
+          time: 60_000,
+        });
+        await confirmation.deferUpdate();
+
+        const actionId = confirmation.customId;
+        console.log("actionId", actionId);
+        let { data: user, error } = await Supabase.from("hxro_users")
+          .select("*")
+          .eq("discord_id", interaction.user.id)
+          .maybeSingle();
+
+        if (!user || error)
+          return await interaction.followUp({
+            content:
+              "You don't have Hrxo wallet. Please run /deposit command to create a new one",
+          });
+
+        const kp = Keypair.fromSecretKey(bs58.decode(user?.sol_wallet_prv!));
+        await settlePosition(kp, actionId);
+
+        return await interaction.followUp({
+          content: `Success`,
+        });
+      }
     } catch (error) {
       console.error(error);
       interaction.editReply({ content: "Something went wrong..." });
